@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+requests
+beautifulsoup4
+newspaper3k
+readability-lxml
+trafilatura
+selenium
+lxml[html_clean]
+chardet
+requests_html
+fake_useragent
+websockets==10.4
+pyppeteer
+redis
