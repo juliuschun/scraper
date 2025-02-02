@@ -13,3 +13,4 @@ fake_useragent
 websockets==10.4
 pyppeteer
 redis
+lxml_html_clean
