@@ -23,9 +23,13 @@ import random
 from pydantic import BaseModel
 from concurrent.futures import ThreadPoolExecutor
 import functools
+import redis
+from datetime import timedelta
+import hashlib
+import os
 
 class ArticleScraper:
-    def __init__(self, headless=True, use_proxy=False, max_workers=30):
+    def __init__(self, headless=True, use_proxy=False, max_workers=30, cache_enabled=True):
         self.USER_AGENTS = [
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -63,6 +67,14 @@ class ArticleScraper:
 
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.semaphore = asyncio.Semaphore(max_workers)
+        self.cache_enabled = cache_enabled
+        self.redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'localhost'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            db=0,
+            decode_responses=True
+        )
+        self.cache_ttl = timedelta(hours=24)  # 캐시 유효기간 24시간
 
     def setup_logging(self):
         logging.basicConfig(
@@ -350,13 +362,46 @@ class ArticleScraper:
             return ""
         return re.sub(r'\s+', ' ', text).strip()
 
+    def _get_cache_key(self, url):
+        """URL에 대한 고유한 캐시 키 생성"""
+        return f"article:{hashlib.md5(url.encode()).hexdigest()}"
+
     async def extract_article_with_metadata_async(self, url, retry=3):
+        if self.cache_enabled:
+            # 캐시 확인
+            cache_key = self._get_cache_key(url)
+            cached_data = self.redis_client.get(cache_key)
+            if cached_data:
+                try:
+                    return json.loads(cached_data)
+                except json.JSONDecodeError:
+                    self.redis_client.delete(cache_key)
+
+        # 캐시가 없으면 실제 스크래핑 수행
         async with self.semaphore:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
-                self.executor,
-                functools.partial(self.extract_article_with_metadata, url, retry)
-            )
+            try:
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    self.executor,
+                    functools.partial(self.extract_article_with_metadata, url, retry)
+                )
+                
+                # 결과 캐싱
+                if self.cache_enabled and result:
+                    cache_key = self._get_cache_key(url)
+                    try:
+                        self.redis_client.setex(
+                            cache_key,
+                            self.cache_ttl,
+                            json.dumps(result)
+                        )
+                    except Exception as e:
+                        self.logger.error(f"캐시 저장 실패: {e}")
+                
+                return result
+            except Exception as e:
+                self.logger.error(f"기사 추출 실패: {e}")
+                raise
 
 # FastAPI 앱
 app = FastAPI(title="Advanced Article Scraper")
@@ -376,38 +421,59 @@ class URLList(BaseModel):
     urls: List[str]
 
 @app.post("/scrape-multiple")
-async def scrape_multiple(url_list: URLList, background_tasks: BackgroundTasks):
-    if len(url_list.urls) > 100:  # 요청 제한
+async def scrape_multiple(
+    url_list: URLList,
+    background_tasks: BackgroundTasks,
+    skip_cache: bool = False
+):
+    if len(url_list.urls) > 100:
         raise HTTPException(400, "최대 100개의 URL만 처리 가능합니다")
     
+    # 캐시 사용 여부 설정
+    original_cache_setting = scraper.cache_enabled
+    if skip_cache:
+        scraper.cache_enabled = False
+    
     try:
-        # 비동기로 모든 URL 처리
         tasks = [
             scraper.extract_article_with_metadata_async(url)
             for url in url_list.urls
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # 결과 포맷팅
         formatted_results = []
         for url, result in zip(url_list.urls, results):
             if isinstance(result, Exception):
                 formatted_results.append({
                     "url": url,
                     "success": False,
-                    "error": str(result)
+                    "error": str(result),
+                    "cached": False
                 })
             else:
                 formatted_results.append({
                     "url": url,
                     "success": True,
-                    "data": result
+                    "data": result,
+                    "cached": not skip_cache and scraper.cache_enabled
                 })
         
         return formatted_results
         
     except Exception as e:
         raise HTTPException(500, detail=str(e))
+    finally:
+        # 원래 캐시 설정 복구
+        scraper.cache_enabled = original_cache_setting
+
+# Redis 헬스체크 엔드포인트
+@app.get("/health/cache")
+async def check_cache_health():
+    try:
+        scraper.redis_client.ping()
+        return {"status": "healthy", "cache": "connected"}
+    except redis.ConnectionError:
+        raise HTTPException(503, detail="Cache service unavailable")
 
 if __name__ == "__main__":
     import uvicorn
